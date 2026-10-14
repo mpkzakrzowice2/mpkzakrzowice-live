@@ -3,20 +3,34 @@
 const express = require('express');
 const crypto = require('node:crypto');
 const path = require('node:path');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = Number(process.env.PORT || 10000);
 const API_KEY = process.env.API_KEY || '';
 const MAP_ADMIN_KEY = process.env.MAP_ADMIN_KEY || '';
 const STALE_AFTER_MS = 30_000;
+const DATABASE_URL = process.env.DATABASE_URL || '';
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '4mb' }));
 app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
-// MVP storage is in memory. It lasts while this service instance runs.
-// After a restart/redeploy, re-upload the road export in the map page.
+// Neon Postgres stores the map permanently; Render's local filesystem is not used.
+let pool = null;
 let mapExport = process.env.MAP_EXPORT || '';
+if (DATABASE_URL) {
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    max: 3,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 15_000
+  });
+  pool.on('error', (error) => {
+    console.error('[mpkzakrzowice] Błąd połączenia z bazą danych:', error.message);
+  });
+}
+
 const servers = new Map();
 
 function keyMatches(provided, expected) {
@@ -40,8 +54,38 @@ function requireMapAdmin(req, res, next) {
   next();
 }
 
+async function initDatabase() {
+  if (!pool) {
+    console.warn('[mpkzakrzowice] Brak DATABASE_URL. Mapa może się wyświetlać z MAP_EXPORT, ale trwały zapis jest wyłączony.');
+    return;
+  }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mpkzakrzowice_settings (
+      setting_key TEXT PRIMARY KEY,
+      setting_value TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  const result = await pool.query(
+    'SELECT setting_value, updated_at FROM mpkzakrzowice_settings WHERE setting_key = $1',
+    ['map_export']
+  );
+  if (result.rowCount > 0) {
+    mapExport = result.rows[0].setting_value;
+    console.log(`[mpkzakrzowice] Wczytano mapę z bazy (${mapExport.length} znaków).`);
+  } else {
+    console.log('[mpkzakrzowice] Baza działa, ale nie zapisano jeszcze mapy. Po zapisaniu mapa przetrwa restarty.');
+  }
+}
+
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'mpkzakrzowice-live', time: new Date().toISOString() });
+  res.json({
+    ok: true,
+    service: 'mpkzakrzowice-live',
+    time: new Date().toISOString(),
+    persistentStorageConfigured: Boolean(pool),
+    mapSaved: Boolean(mapExport)
+  });
 });
 
 app.get('/api/positions', (_req, res) => {
@@ -93,10 +137,10 @@ app.post('/api/positions', requireApiKey, (req, res) => {
 
 app.get('/api/map', (_req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json({ data: mapExport });
+  res.json({ data: mapExport, persistent: Boolean(pool) });
 });
 
-app.post('/api/map', requireMapAdmin, (req, res) => {
+app.post('/api/map', requireMapAdmin, async (req, res) => {
   const data = req.body && req.body.data;
   if (typeof data !== 'string' || data.length > 2_000_000) {
     return res.status(400).json({ error: 'Brak danych mapy albo eksport jest za duży.' });
@@ -104,12 +148,35 @@ app.post('/api/map', requireMapAdmin, (req, res) => {
   if (!data.includes('OBRYSY:')) {
     return res.status(400).json({ error: 'Eksport musi zawierać wiersze OBRYSY: z Roblox Studio.' });
   }
-  mapExport = data;
-  res.json({ ok: true, chars: data.length });
+  if (!pool) {
+    return res.status(503).json({ error: 'Trwały zapis nie jest skonfigurowany. Dodaj DATABASE_URL z Neon w Render → Environment.' });
+  }
+  try {
+    const result = await pool.query(
+      `INSERT INTO mpkzakrzowice_settings (setting_key, setting_value, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (setting_key) DO UPDATE
+       SET setting_value = EXCLUDED.setting_value, updated_at = NOW()
+       RETURNING updated_at`,
+      ['map_export', data]
+    );
+    mapExport = data;
+    res.json({ ok: true, chars: data.length, savedAt: result.rows[0].updated_at, persistent: true });
+  } catch (error) {
+    console.error('[mpkzakrzowice] Nie udało się zapisać mapy do bazy:', error.message);
+    res.status(500).json({ error: 'Nie udało się zapisać mapy w bazie Neon. Sprawdź DATABASE_URL w Render.' });
+  }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`mpkzakrzowice-live działa na porcie ${PORT}`);
-  if (!API_KEY) console.warn('Brak zmiennej API_KEY — endpoint przyjmujący autobusy pozostanie niedostępny.');
-  if (!MAP_ADMIN_KEY) console.warn('Brak zmiennej MAP_ADMIN_KEY — zapisywanie mapy pozostanie niedostępne.');
-});
+initDatabase()
+  .then(() => {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`mpkzakrzowice-live działa na porcie ${PORT}`);
+      if (!API_KEY) console.warn('[mpkzakrzowice] Brak zmiennej API_KEY — endpoint przyjmujący autobusy pozostanie niedostępny.');
+      if (!MAP_ADMIN_KEY) console.warn('[mpkzakrzowice] Brak zmiennej MAP_ADMIN_KEY — zapisywanie mapy pozostanie niedostępne.');
+    });
+  })
+  .catch((error) => {
+    console.error('[mpkzakrzowice] Nie można uruchomić bazy Neon:', error.message);
+    process.exit(1);
+  });
