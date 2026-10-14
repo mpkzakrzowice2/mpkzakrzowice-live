@@ -140,6 +140,81 @@ app.get('/api/map', (_req, res) => {
   res.json({ data: mapExport, persistent: Boolean(pool) });
 });
 
+// One-time map import directly from Roblox, so the owner does not need to copy the large export text.
+// The import is accepted only while no saved map exists; chunks are committed to Neon when complete.
+const mapUploads = new Map();
+
+app.post('/api/map/import-chunk', requireApiKey, async (req, res) => {
+  const body = req.body || {};
+  const uploadId = typeof body.uploadId === 'string' ? body.uploadId.slice(0, 128) : '';
+  const index = Number(body.index);
+  const total = Number(body.total);
+  const chunk = body.chunk;
+
+  if (!uploadId || !Number.isInteger(index) || !Number.isInteger(total) || total < 1 || total > 2000 || index < 1 || index > total) {
+    return res.status(400).json({ error: 'Nieprawidłowe informacje o fragmencie importu.' });
+  }
+  if (typeof chunk !== 'string' || chunk.length > 1800 || !/^[A-Za-z0-9_-]+$/.test(chunk) || chunk.length % 9 !== 0) {
+    return res.status(400).json({ error: 'Fragment eksportu jest nieprawidłowy.' });
+  }
+  if (!pool) {
+    return res.status(503).json({ error: 'Trwały zapis nie jest skonfigurowany: brak DATABASE_URL.' });
+  }
+
+  // If a map is already saved, do not reupload it on every new game server start.
+  if (mapExport && !mapUploads.has(uploadId)) {
+    return res.json({ ok: true, skipped: true, reason: 'Mapa jest już zapisana w bazie.' });
+  }
+
+  let session = mapUploads.get(uploadId);
+  if (!session) {
+    session = { total, chunks: new Array(total), startedAt: Date.now() };
+    mapUploads.set(uploadId, session);
+  }
+  if (session.total !== total) {
+    mapUploads.delete(uploadId);
+    return res.status(400).json({ error: 'Liczba fragmentów zmieniła się podczas importu.' });
+  }
+  session.chunks[index - 1] = chunk;
+  session.updatedAt = Date.now();
+  const received = session.chunks.filter((part) => typeof part === 'string').length;
+
+  if (received < session.total) {
+    return res.json({ ok: true, received, total: session.total, complete: false });
+  }
+
+  const joined = session.chunks.join('');
+  if (!joined || joined.length % 9 !== 0) {
+    mapUploads.delete(uploadId);
+    return res.status(400).json({ error: 'Eksport jest niekompletny albo ma nieprawidłową długość.' });
+  }
+  const exportText = session.chunks.map((part) => `OBRYSY: ${part}`).join('\n');
+
+  try {
+    await pool.query(
+      `INSERT INTO mpkzakrzowice_settings (setting_key, setting_value, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (setting_key) DO UPDATE
+       SET setting_value = EXCLUDED.setting_value, updated_at = NOW()`,
+      ['map_export', exportText]
+    );
+    mapExport = exportText;
+    mapUploads.delete(uploadId);
+    console.log(`[mpkzakrzowice] Zapisano mapę bezpośrednio z Roblox (${joined.length / 9} części, ${joined.length} znaków).`);
+    return res.json({ ok: true, complete: true, roads: joined.length / 9, chars: joined.length, persistent: true });
+  } catch (error) {
+    console.error('[mpkzakrzowice] Import mapy z Roblox nie powiódł się:', error.message);
+    return res.status(500).json({ error: 'Nie udało się zapisać mapy w Neon.' });
+  }
+});
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of mapUploads.entries()) {
+    if (now - (session.updatedAt || session.startedAt) > 10 * 60 * 1000) mapUploads.delete(id);
+  }
+}, 60 * 1000).unref();
+
 app.post('/api/map', requireMapAdmin, async (req, res) => {
   const data = req.body && req.body.data;
   if (typeof data !== 'string' || data.length > 2_000_000) {
